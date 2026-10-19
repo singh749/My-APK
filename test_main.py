@@ -183,7 +183,8 @@ def test_extract_candidates():
 def test_preprocess_variants_shapes_and_modes(tmp_path):
     img = main.load_image(make_photo(str(tmp_path / "p.png")))
     variants = main.preprocess_variants(img)
-    assert set(variants) == {"gray", "enhanced", "otsu", "adaptive", "inverted"}
+    assert set(variants) == {"gray", "enhanced", "otsu", "adaptive", "inverted",
+                             "relief", "relief_soft"}
     for v in variants.values():
         assert v.mode == "L"
     for name in ("otsu", "adaptive"):
