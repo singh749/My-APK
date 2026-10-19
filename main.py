@@ -36,6 +36,7 @@ ANDROID = "ANDROID_ARGUMENT" in os.environ or "ANDROID_STORAGE" in os.environ
 AMBIGUOUS = {"O": "0", "0": "O", "I": "1", "1": "I", "S": "5", "5": "S",
              "B": "8", "8": "B", "Z": "2", "2": "Z"}
 
+REJECT_CONFIDENCE = 30  # below this the guess is NOT put in the result field
 LOW_CONFIDENCE = 70  # Tesseract mean confidence (0-100) below this -> warning
 MIN_LENGTH = 5
 
@@ -311,7 +312,7 @@ def preprocess_variants(img, target=1600, line_height=110):
 @dataclass
 class OcrResult:
     text: str = ""
-    confidence: float = 0.0
+    confidence: float = 0.0   # None = engine gave no confidence
     raw_text: str = ""
     alternatives: list = field(default_factory=list)
     warnings: list = field(default_factory=list)
@@ -340,7 +341,8 @@ def uncertain_char_warnings(text):
 
 
 def _score(cand, conf):
-    s = conf / 100.0 + 0.1 * any(c.isdigit() for c in cand) + 0.15 * (
+    # Squaring the confidence makes low-confidence guesses count for very little.
+    s = (conf / 100.0) ** 2 + 0.1 * any(c.isdigit() for c in cand) + 0.15 * (
         min(len(cand), 17) / 17.0)
     return s - (0.4 if len(cand) > 20 else 0.0)
 
@@ -353,34 +355,68 @@ PASS_PLAN = [("enhanced", 6), ("enhanced", 7), ("otsu", 6),
              ("relief_soft", 8)]
 
 
-def run_ocr(img, backend, plan=PASS_PLAN, progress=None):
-    """Run every pass in `plan` and combine the readings.
+def ml_images(img):
+    """Views for the ML Kit recognizer (it prefers large, natural images)."""
+    longest = max(img.size)
+    k = 1.0
+    if longest > 1800:
+        k = 1800.0 / longest
+    elif longest < 800:
+        k = min(800.0 / longest, 3.0)
+    color = img.convert("RGB")
+    if abs(k - 1.0) > 0.05:
+        color = color.resize((max(1, int(color.width * k)),
+                              max(1, int(color.height * k))), Image.LANCZOS)
+    gray = ImageOps.autocontrast(ImageOps.grayscale(color), cutoff=1)
+    enhanced = ImageOps.autocontrast(gray.filter(
+        ImageFilter.UnsharpMask(radius=2, percent=150, threshold=3)), cutoff=1)
+    return {"color": color, "gray": gray, "enhanced": enhanced}
 
-    `backend.recognize(pil_image, psm)` must return (text, confidence 0-100).
+
+EXTRA_PLAN = ["color", "gray", "enhanced"]
+
+
+def run_ocr(img, backend, plan=PASS_PLAN, progress=None, extra=None,
+            extra_plan=EXTRA_PLAN):
+    """Run every pass and combine the readings.
+
+    `backend.recognize(pil_image, psm)` (Tesseract) and the optional
+    `extra.recognize(pil_image, 0)` (ML Kit) must return (text, confidence).
+    Confidence is 0-100, or None when the engine does not report one.
     Individual pass failures are skipped; if every pass fails the last error is
     raised so the UI can show it.
     """
-    variants = preprocess_variants(img)
-    votes = {}   # candidate -> [total_score, passes_agreeing]
-    raw_parts, confs, last_error, ok_passes = [], [], None, 0
-    for i, (name, psm) in enumerate(plan):
+    jobs = []
+    if backend is not None:
+        variants = preprocess_variants(img)
+        jobs += [("tess", name, psm, variants[name]) for name, psm in plan]
+    if extra is not None:
+        views = ml_images(img)
+        jobs += [("mlkit", name, 0, views[name]) for name in extra_plan]
+    votes = {}   # candidate -> [total_score, passes_agreeing, [confidences]]
+    raw_parts, last_error, ok_passes = [], None, 0
+    for i, (engine, name, psm, vimg) in enumerate(jobs):
         if progress:
-            progress(i, len(plan))
+            progress(i, len(jobs))
         try:
-            text, conf = backend.recognize(
-                ImageOps.expand(variants[name], 20, 255), psm)
+            if engine == "tess":
+                text, conf = backend.recognize(ImageOps.expand(vimg, 20, 255), psm)
+            else:
+                text, conf = extra.recognize(vimg, 0)
         except Exception as exc:  # noqa: BLE001
             last_error = exc
             continue
         ok_passes += 1
         text = text or ""
         if text.strip():
-            raw_parts.append("[%s/psm%d] %s" % (name, psm, text.strip()))
-        confs.append(conf or 0)
+            raw_parts.append("[%s/%s/psm%d] %s" % (engine, name, psm, text.strip()))
         for cand in extract_candidates(text):
-            v = votes.setdefault(cand, [0.0, 0])
-            v[0] += _score(cand, conf or 0)
+            v = votes.setdefault(cand, [0.0, 0, []])
+            # ML Kit reports no confidence: give it a fixed, fairly high weight.
+            v[0] += _score(cand, conf if conf is not None else 80)
             v[1] += 1
+            if conf is not None:
+                v[2].append(conf)
     if ok_passes == 0 and last_error is not None:
         raise last_error
 
@@ -392,22 +428,36 @@ def run_ocr(img, backend, plan=PASS_PLAN, progress=None):
             "and press Scan Again. You can also type the number manually.")
         return result
 
-    ranked = sorted(votes.items(), key=lambda kv: kv[1][0] + 0.2 * kv[1][1],
+    # Quality first (average score per pass), repetition as a modest bonus, so
+    # many repeats of a poor reading cannot outvote a good one.
+    ranked = sorted(votes.items(),
+                    key=lambda kv: (kv[1][0] / kv[1][1]) * (1 + 0.15 * (kv[1][1] - 1)),
                     reverse=True)
-    best, (_, agree) = ranked[0]
+    best, (_, agree, best_confs) = ranked[0]
     result.text = best
-    result.confidence = round(sum(confs) / len(confs), 1) if confs else 0.0
+    result.confidence = round(sum(best_confs) / len(best_confs), 1) \
+        if best_confs else None
     result.alternatives = [c for c, _ in ranked[1:6]
                            if difflib.SequenceMatcher(None, best, c).ratio() >= 0.6]
+    if result.confidence is not None and result.confidence < REJECT_CONFIDENCE:
+        # Almost certainly noise: never present it as "the" engine number.
+        result.alternatives = [best] + result.alternatives
+        result.text = ""
+        result.warnings.append(
+            "The number could not be read reliably (confidence %.0f%%). The "
+            "guess '%s' is probably wrong - it is only listed under 'Other "
+            "possible readings'. Crop tightly around the number and press Scan "
+            "Again, or type the number yourself." % (result.confidence, best))
+        return result
     if result.alternatives:
         result.warnings.append(
             "Different scan methods read this number differently: "
             + ", ".join(result.alternatives[:3]) + ". Check carefully.")
-    elif agree == 1 and len(plan) > 1:
+    elif agree == 1 and len(jobs) > 1:
         result.warnings.append("Only one scan method found this number.")
     if len(best) < MIN_LENGTH:
         result.warnings.append("The result is very short; it may be incomplete.")
-    if result.confidence < LOW_CONFIDENCE:
+    if result.confidence is not None and result.confidence < LOW_CONFIDENCE:
         result.warnings.append("Low OCR confidence (%.0f%%)." % result.confidence)
     notes = uncertain_char_warnings(best)
     if notes:
@@ -473,6 +523,52 @@ class AndroidTesseract:
                 if os.path.exists(path):
                     os.remove(path)
         return text, conf
+
+
+class AndroidMLKit:
+    """Google ML Kit text recognition (bundled model, works offline).
+
+    Like Tesseract, its Java classes must be looked up on the main thread, so
+    everything is resolved in __init__ and only used from the OCR thread."""
+
+    def __init__(self, cache_dir):
+        self.cache_dir = cache_dir
+        try:
+            from jnius import autoclass
+            rec = autoclass("com.google.mlkit.vision.text.TextRecognition")
+            opts = autoclass(
+                "com.google.mlkit.vision.text.latin.TextRecognizerOptions")
+            self._InputImage = autoclass(
+                "com.google.mlkit.vision.common.InputImage")
+            self._Tasks = autoclass("com.google.android.gms.tasks.Tasks")
+            self._Bitmaps = autoclass("android.graphics.BitmapFactory")
+            self.client = rec.getClient(opts.DEFAULT_OPTIONS)
+        except Exception as exc:  # noqa: BLE001
+            raise OcrUnavailable(
+                "The ML Kit library is not inside this APK (%s)." % exc)
+
+    def recognize(self, pil_img, psm=0):
+        path = os.path.join(self.cache_dir, "mlk_%s.jpg" % uuid.uuid4().hex)
+        pil_img.convert("RGB").save(path, "JPEG", quality=95)
+        bitmap = None
+        try:
+            bitmap = self._Bitmaps.decodeFile(path)
+            if bitmap is None:
+                raise RuntimeError("Could not decode the image for ML Kit.")
+            image = self._InputImage.fromBitmap(bitmap, 0)
+            task = self.client.process(image)
+            # "await" is a Python keyword, so it is fetched with getattr.
+            result = getattr(self._Tasks, "await")(task)
+            text = result.getText() or ""
+        finally:
+            if bitmap is not None:
+                try:
+                    bitmap.recycle()
+                except Exception:  # noqa: BLE001
+                    pass
+            if os.path.exists(path):
+                os.remove(path)
+        return text, None
 
 
 class DesktopTesseract:
@@ -752,13 +848,15 @@ def build_app():  # noqa: C901 - one flat function keeps the project to one file
                     pass
             self.db = HistoryDB(os.path.join(self.data_dir, "scans.db"),
                                 os.path.join(self.data_dir, "images"))
-            self.backend, self.ocr_error, self.media = None, None, None
+            self.backend, self.extra, self.media = None, None, None
+            self.ocr_error = None
             self.base_image = self.work_image = self.result = None
             self.rotation = 0
             self.detail_id = None
             self.history_query = ""
-            try:
-                app_dir = os.path.dirname(os.path.abspath(__file__))
+            app_dir = os.path.dirname(os.path.abspath(__file__))
+            problems = []
+            try:  # engine 1: Tesseract
                 if ANDROID:
                     install_language_data(app_dir, self.data_dir)
                     self.backend = AndroidTesseract(self.data_dir, self.cache_dir)
@@ -767,7 +865,14 @@ def build_app():  # noqa: C901 - one flat function keeps the project to one file
                         app_dir if os.path.exists(os.path.join(
                             app_dir, "eng.traineddata")) else None)
             except OcrUnavailable as exc:
-                self.ocr_error = str(exc)
+                problems.append(str(exc))
+            if ANDROID:  # engine 2: ML Kit (offline, bundled model)
+                try:
+                    self.extra = AndroidMLKit(self.cache_dir)
+                except OcrUnavailable as exc:
+                    problems.append(str(exc))
+            if problems:
+                self.ocr_error = " | ".join(problems)
             if ANDROID:
                 try:
                     self.media = AndroidMedia(
@@ -989,7 +1094,7 @@ def build_app():  # noqa: C901 - one flat function keeps the project to one file
 
         # ------------------------------------------------------------- ocr
         def start_ocr(self):
-            if self.backend is None:
+            if self.backend is None and self.extra is None:
                 return notify("OCR engine unavailable:\n%s" % self.ocr_error, 5)
             self.work_image = self.current_image()
             self.busy = ModalView(size_hint=(0.8, None), height=dp(110),
@@ -1001,7 +1106,7 @@ def build_app():  # noqa: C901 - one flat function keeps the project to one file
 
             def work():
                 try:
-                    res = run_ocr(self.work_image, self.backend,
+                    res = run_ocr(self.work_image, self.backend, extra=self.extra,
                                   progress=lambda i, n: Clock.schedule_once(
                                       lambda dt: setattr(
                                           self.busy_label, "text",
