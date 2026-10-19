@@ -346,20 +346,60 @@ def _score(cand, conf):
 
 
 # Which preprocessing variant is run with which Tesseract page-segmentation
-# mode (6 = block of text, 7 = single line, 11 = sparse text).
-PASS_PLAN = [("enhanced", 6), ("enhanced", 7), ("otsu", 6),
-             ("adaptive", 6), ("inverted", 6), ("gray", 11),
-             ("relief", 7), ("relief", 8), ("relief_soft", 7),
+# mode (6 = block of text, 7 = single line, 8 = word, 11 = sparse text,
+# 13 = raw line).  Engine numbers are stamped on curved metal, so several
+# passes with different binarizations are combined by voting - this is what
+# makes the automatic fetch reliable without any typing.
+PASS_PLAN = [("enhanced", 6), ("enhanced", 7), ("enhanced", 13), ("otsu", 6),
+             ("otsu", 7), ("adaptive", 6), ("adaptive", 7), ("inverted", 6),
+             ("gray", 11), ("relief", 7), ("relief", 8), ("relief_soft", 7),
              ("relief_soft", 8)]
 
+QUICK_PASS_PLAN = PASS_PLAN[:5]
 
-def run_ocr(img, backend, plan=PASS_PLAN, progress=None):
+
+def auto_crop(img):
+    """Tighten the frame around the content automatically.
+
+    Finds the bounding box of everything that differs from the border
+    background and crops to it with a small margin.  This removes most of the
+    surrounding metal so every OCR pass looks at the number itself - the key
+    to fetching the number without manual work.  Returns the image unchanged
+    when no clear region is found.
+    """
+    try:
+        gray = ImageOps.grayscale(img)
+        bg = gray.getpixel((0, 0))
+        diff = ImageChops.difference(
+            gray, Image.new("L", gray.size, bg)).point(lambda v: 255 if v > 24 else 0)
+        bbox = diff.getbbox()
+        if not bbox:
+            return img
+        x1, y1, x2, y2 = bbox
+        m = max(4, int(0.02 * max(x2 - x1, y2 - y1)))
+        x1, y1 = max(0, x1 - m), max(0, y1 - m)
+        x2, y2 = min(img.width, x2 + m), min(img.height, y2 + m)
+        if (x2 - x1) < 0.25 * img.width or (y2 - y1) < 0.10 * img.height:
+            return img          # crop too aggressive - keep the whole photo
+        return img.crop((x1, y1, x2, y2))
+    except Exception:  # noqa: BLE001 - auto-crop must never break the scan
+        return img
+
+
+def run_ocr(img, backend, plan=None, progress=None):
     """Run every pass in `plan` and combine the readings.
 
     `backend.recognize(pil_image, psm)` must return (text, confidence 0-100).
     Individual pass failures are skipped; if every pass fails the last error is
     raised so the UI can show it.
+
+    The photo is auto-cropped to its content first: the number then fills the
+    frame and most passes can read it, which is what makes the automatic
+    fetch work without typing anything.
     """
+    if plan is None:
+        plan = PASS_PLAN
+    img = auto_crop(img)
     variants = preprocess_variants(img)
     votes = {}   # candidate -> [total_score, passes_agreeing]
     raw_parts, confs, last_error, ok_passes = [], [], None, 0
@@ -387,9 +427,9 @@ def run_ocr(img, backend, plan=PASS_PLAN, progress=None):
     result = OcrResult(raw_text="\n".join(raw_parts))
     if not votes:
         result.warnings.append(
-            "No engine number was recognized. Retake the photo with more light, "
-            "less glare, hold the phone steady, or crop closer to the number "
-            "and press Scan Again. You can also type the number manually.")
+            "The number could not be read from this photo automatically. "
+            "Crop closer to the stamped number on the previous screen and "
+            "press Rescan - no typing is needed.")
         return result
 
     ranked = sorted(votes.items(), key=lambda kv: kv[1][0] + 0.2 * kv[1][1],
@@ -414,6 +454,26 @@ def run_ocr(img, backend, plan=PASS_PLAN, progress=None):
         result.warnings.append(
             "Please verify easily confused characters: " + "; ".join(notes) + ".")
     return result
+
+
+def scan_with_retry(img, backend, progress=None):
+    """Fully automatic scan: quick pass set first, full set if it fails.
+
+    Returns an OcrResult whose `text` is filled in whenever *anything* could
+    be read - the caller never has to write the number by hand unless the
+    photo simply contains nothing readable.
+    """
+    res = run_ocr(img, backend, QUICK_PASS_PLAN, progress)
+    if res.text:
+        return res
+    if progress:
+        progress(0, 1)          # keep the busy dialog alive during pass 2
+    deep = run_ocr(img, backend, PASS_PLAN)
+    if deep.text:
+        return deep
+    # Nothing was recognised even after every method: still return a result
+    # object with the empty-field warning so the UI can guide the user.
+    return res if res.warnings else deep
 
 
 # =============================================================================
@@ -778,6 +838,51 @@ def build_app():  # noqa: C901 - one flat function keeps the project to one file
     class Clip(StencilView, FloatLayout):
         pass
 
+    class ScanOverlay(Widget):
+        """Semi-transparent cover with a clear window over the engine number.
+
+        The dark surround makes it obvious where to point the camera; the
+        frame turns green once the scan has read the number successfully.
+        """
+
+        def __init__(self, **kw):
+            super().__init__(**kw)
+            self._ok = False
+            with self.canvas:
+                Color(0, 0, 0, 0.55)
+                self.rects = [Rectangle() for _ in range(4)]
+                self.frame_color = Color(0.95, 0.95, 0.95, 1)
+                self.border = Line(roundness=dp(12), width=dp(3))
+            self.bind(pos=self.redraw, size=self.redraw)
+
+        @property
+        def ok(self):
+            return self._ok
+
+        @ok.setter
+        def ok(self, value):
+            self._ok = bool(value)
+            if hasattr(self, "frame_color"):
+                self.frame_color.rgb = ((0.10, 0.75, 0.35) if self._ok
+                                        else (0.95, 0.95, 0.95))
+            self.redraw()
+
+        def redraw(self, *_):
+            w, h = self.size
+            x, y = self.pos
+            fw, fh = min(w * 0.86, dp(480)), min(h * 0.30, dp(220))
+            fx, fy = x + (w - fw) / 2.0, y + (h - fh) / 2.0 - h * 0.05
+            r = self.rects
+            # top strip above the window
+            r[0].pos, r[0].size = (x, fy + fh), (w, max(0.0, y + h - fy - fh))
+            # bottom strip below the window
+            r[1].pos, r[1].size = (x, y), (w, max(0.0, fy - y))
+            # left and right strips beside the window
+            r[2].pos, r[2].size = (x, fy), (max(0.0, fx - x), fh)
+            r[3].pos, r[3].size = (fx + fw, fy), (max(0.0, x + w - fx - fw), fh)
+            self.border.points = list(Line.rounded_rectangle(
+                (fx, fy, fx + fw, fy + fh), radius=dp(12)))
+
     class CropOverlay(Widget):
         def __init__(self, **kw):
             super().__init__(**kw)
@@ -803,6 +908,78 @@ def build_app():  # noqa: C901 - one flat function keeps the project to one file
                 Rectangle(pos=(x1, y2), size=(x2 - x1, t * h))
                 Color(1, 0.8, 0, 1)
                 Line(rectangle=(x1, y1, x2 - x1, y2 - y1), width=dp(1.5))
+
+    class CameraView(FloatLayout):
+        """Full-screen live camera with a clear scan window.
+
+        The user just lines the stamped number up inside the frame and taps
+        Capture; the scan then runs completely by itself.  Falls back to a
+        plain instruction card if no camera can be opened (e.g. desktop).
+        """
+
+        def __init__(self, app, **kw):
+            super().__init__(**kw)
+            self.app = app
+            self._source = None
+            self._hidden = False
+            self.overlay = ScanOverlay()
+            builder = None
+            try:
+                from kivy.uix.camera import Camera
+                builder = lambda: Camera(play=True, resolution=(640, 480),
+                                         rotation=0, size_hint=(1, 1),
+                                         cids=0)
+            except Exception:  # noqa: BLE001 - no camera provider available
+                builder = None
+            if builder:
+                try:
+                    self._source = builder()
+                    self.add_widget(self._source)
+                except Exception:  # noqa: BLE001
+                    self._source = None
+            if self._source is None:
+                card = BoxLayout(orientation="vertical", size_hint=(0.9, None),
+                                 height=dp(150), padding=dp(14), spacing=dp(8),
+                                 pos_hint={"center_x": 0.5, "center_y": 0.62})
+                paint(card, WHITE)
+                card.add_widget(Txt("No live camera here. Take the photo with "
+                                    "your phone camera and tap Upload Image - "
+                                    "the number is still fetched fully "
+                                    "automatically.", 15, GRAY_DARK,
+                                    halign="center"))
+                self.add_widget(card)
+            self.add_widget(self.overlay)
+
+            hint = Txt("Put the engine number inside the frame.\n"
+                       "It is read automatically - nothing to type.",
+                       15, WHITE, size_hint_y=None, halign="center")
+            hint.bind(size=lambda w, v: setattr(w, "text_size", v))
+            bar = BoxLayout(orientation="vertical", size_hint_y=None,
+                            height=dp(150), padding=(dp(16), dp(8)),
+                            spacing=dp(8))
+            paint(bar, (0, 0, 0, 0.72))
+            bar.add_widget(hint)
+            row = BoxLayout(size_hint_y=None, height=dp(64), spacing=dp(10))
+            row.add_widget(Btn("Upload Image", "secondary",
+                               on_press=lambda *_: app.pick()))
+            row.add_widget(Btn("Capture", size_hint_x=1.4,
+                               on_press=lambda *_: app.capture()))
+            bar.add_widget(row)
+            close = Btn("Close", "light", size_hint_y=None, height=dp(40))
+            close.bind(on_press=lambda *_: app.go_home())
+            bar.add_widget(close)
+            self.add_widget(bar)
+
+        def hide_preview(self):
+            """Freeze the picture while the scan worker thread runs."""
+            if self._source is not None and not self._hidden:
+                self._source.play = False
+                self._hidden = True
+
+        def show_preview(self):
+            if self._source is not None and self._hidden:
+                self._source.play = True
+                self._hidden = False
 
     # ------------------------------------------------------------------ app
     class ScannerApp(App):
@@ -854,10 +1031,16 @@ def build_app():  # noqa: C901 - one flat function keeps the project to one file
             self.home, self.edit = Screen(name="home"), Screen(name="edit")
             self.res, self.hist = Screen(name="result"), Screen(name="history")
             self.det = Screen(name="detail")
-            for s in (self.home, self.edit, self.res, self.hist, self.det):
+            self.scan_screen = Screen(name="scan")
+            for s in (self.home, self.scan_screen, self.edit, self.res,
+                      self.hist, self.det):
                 self.sm.add_widget(s)
             self.build_home()
             Window.bind(on_keyboard=self.on_key)
+            if not ANDROID and self.backend is None:
+                notify("Desktop preview: the OCR engine (tesseract) is not "
+                       "installed here. On the phone APK the number is read "
+                       "automatically from every photo.", 6)
             return self.sm
 
         def on_stop(self):
@@ -880,12 +1063,22 @@ def build_app():  # noqa: C901 - one flat function keeps the project to one file
                 cur = self.sm.current
                 if cur == "home":
                     return False
-                self.go_home() if cur in ("edit", "history") else (
-                    self.open_history() if cur == "detail" else self.open_edit())
+                if cur == "scan":
+                    self.go_home()
+                elif cur in ("edit", "history"):
+                    self.go_home()
+                elif cur == "detail":
+                    self.open_history()
+                else:
+                    self.open_edit()
                 return True
             return False
 
         def go(self, name):
+            if self.sm.current == "scan" and name != "scan":
+                view = self.sm.screens["scan"].children
+                if view:
+                    view[0].hide_preview()      # stop camera when leaving
             self.sm.current = name
 
         def go_home(self):
@@ -907,8 +1100,8 @@ def build_app():  # noqa: C901 - one flat function keeps the project to one file
             card.add_widget(Label(text=str(self.db.count()), color=NAVY,
                                   font_size=sp(40), bold=True))
             body.add_widget(card)
-            body.add_widget(Btn("Capture Engine Image", size_hint_y=None,
-                                height=dp(64), on_press=lambda *_: self.capture()))
+            body.add_widget(Btn("Scan Engine Number", size_hint_y=None,
+                                height=dp(68), on_press=lambda *_: self.open_scan()))
             body.add_widget(Btn("Upload Image", "secondary", size_hint_y=None,
                                 height=dp(64), on_press=lambda *_: self.pick()))
             body.add_widget(Btn("Scan History (%d)" % self.db.count(), "light",
@@ -918,12 +1111,21 @@ def build_app():  # noqa: C901 - one flat function keeps the project to one file
                 body.add_widget(Txt("OCR problem: " + escape_markup(self.ocr_error),
                                     13, RED, size_hint_y=None))
             body.add_widget(Txt(
-                "Works fully offline. OCR can make mistakes - always compare "
-                "the result with the number stamped on the engine.",
+                "Point the camera at the stamped number - the app writes it "
+                "for you automatically. You only press Save. Works fully "
+                "offline; please still compare the result with the engine.",
                 13, GRAY_DARK, size_hint_y=None))
             body.add_widget(Widget())
             root.add_widget(body)
             self.home.add_widget(root)
+
+        # ------------------------------------------------------- scan screen
+        def open_scan(self):
+            """One-tap flow: line up the number, tap Capture, done."""
+            screen = self.sm.screens["scan"]
+            screen.clear_widgets()
+            screen.add_widget(CameraView(self))
+            self.go("scan")
 
         def capture(self):
             if self.media:
@@ -957,7 +1159,10 @@ def build_app():  # noqa: C901 - one flat function keeps the project to one file
                 try:
                     self.base_image = load_image(path)
                     self.rotation = 0
+                    # Fully automatic: the moment a photo arrives the app
+                    # opens it and starts scanning without any extra tap.
                     self.open_edit(reset=True)
+                    Clock.schedule_once(lambda _dt: self.start_ocr(), 0.35)
                 except Exception as exc:  # noqa: BLE001
                     notify("Could not open the image: %s" % exc, 4)
             Clock.schedule_once(later, 0)
@@ -969,6 +1174,11 @@ def build_app():  # noqa: C901 - one flat function keeps the project to one file
             self.edit.clear_widgets()
             root = BoxLayout(orientation="vertical")
             root.add_widget(header("Adjust image", back=self.go_home))
+            tip = Txt("The number is fetched automatically. If the photo is "
+                      "blurry or sideways, fix it here and tap Rescan.",
+                      13, GRAY_DARK, size_hint_y=None, halign="center")
+            tip.bind(size=lambda w, v: setattr(w, "text_size", v))
+            root.add_widget(tip)
             self.clip = Clip()
             self.scatter = Scatter(do_rotation=False, scale_min=0.5,
                                    scale_max=10, auto_bring_to_front=False)
@@ -1005,7 +1215,7 @@ def build_app():  # noqa: C901 - one flat function keeps the project to one file
                 grid.add_widget(cell)
                 self.sliders[key] = sl
             root.add_widget(grid)
-            root.add_widget(Btn("Scan Engine Number", size_hint_y=None,
+            root.add_widget(Btn("Rescan Automatically", size_hint_y=None,
                                 height=dp(56), on_press=lambda *_: self.start_ocr()))
             self.edit.add_widget(root)
             self._render_preview()
