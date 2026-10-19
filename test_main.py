@@ -179,6 +179,35 @@ def test_extract_candidates():
     assert main.extract_candidates("") == []
 
 
+# ---- second engine (ML Kit) --------------------------------------------------
+def test_second_engine_beats_garbage_from_first_engine():
+    tess = FakeBackend([("83HCCHCCC", 19)])
+    mlkit = FakeBackend([("3831707", None)])
+    res = run_ocr(Image.new("RGB", (300, 100), "white"), tess, extra=mlkit)
+    assert res.text == "3831707"
+    assert res.confidence is None                  # ML Kit gives no confidence
+    assert not any("Low OCR confidence" in w for w in res.warnings)
+
+
+def test_pipeline_works_with_only_second_engine():
+    mlkit = FakeBackend([("U223582", None)])
+    res = run_ocr(Image.new("RGB", (300, 100), "white"), None, extra=mlkit)
+    assert res.text == "U223582" and mlkit.calls == 3
+
+
+def test_failing_second_engine_does_not_break_first():
+    tess = FakeBackend([("K15B1234567", 90)])
+    mlkit = FakeBackend([RuntimeError("ml kit broke")])
+    res = run_ocr(Image.new("RGB", (300, 100), "white"), tess, extra=mlkit)
+    assert res.text == "K15B1234567" and res.confidence == 90
+
+
+def test_ml_views():
+    views = main.ml_images(Image.new("RGB", (4000, 1000)))
+    assert max(views["color"].size) == 1800
+    assert views["gray"].mode == "L" and views["enhanced"].mode == "L"
+
+
 # ---- image preprocessing -----------------------------------------------------
 def test_preprocess_variants_shapes_and_modes(tmp_path):
     img = main.load_image(make_photo(str(tmp_path / "p.png")))
@@ -236,3 +265,11 @@ def test_real_tesseract_reads_synthetic_photo(tmp_path):
     img = main.load_image(make_photo(str(tmp_path / "p.png")))
     res = run_ocr(img, main.DesktopTesseract(str(tessdir)))
     assert res.text.replace("-", "") == "K15B1234567"
+
+
+def test_very_low_confidence_guess_is_not_presented_as_the_answer():
+    res = run_ocr(Image.new("RGB", (300, 100), "white"),
+                  FakeBackend([("83HCCHCCC", 19)]))
+    assert res.text == ""                         # field stays empty
+    assert "83HCCHCCC" in res.alternatives        # still available to pick
+    assert any("could not be read reliably" in w for w in res.warnings)
