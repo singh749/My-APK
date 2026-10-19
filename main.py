@@ -735,13 +735,14 @@ def build_app():  # noqa: C901 - one flat function keeps the project to one file
         Clock.schedule_once(lambda dt: view.dismiss(), seconds)
 
     def show_error(title, message):
-        """Dismissible, scrollable popup for long messages (Java exceptions)."""
+        """Scrollable popup for long error messages (Java exceptions)."""
         box = BoxLayout(orientation="vertical", padding=dp(10), spacing=dp(8))
         scroll = ScrollView(size_hint=(1, 1))
         label = Label(text=message, color=WHITE, font_size=sp(13),
                       halign="left", valign="top", size_hint_y=None)
         label.bind(width=lambda w, v: setattr(w, "text_size", (v, None)))
-        label.bind(texture_size=lambda w, ts: setattr(w, "height", ts[1] + dp(8)))
+        label.bind(texture_size=lambda w, ts: setattr(
+            w, "height", ts[1] + dp(8)))
         scroll.add_widget(label)
         box.add_widget(scroll)
         pop = Popup(title=title, content=box, size_hint=(0.92, 0.65),
