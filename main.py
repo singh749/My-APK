@@ -423,12 +423,68 @@ class OcrUnavailable(Exception):
     pass
 
 
+TESS_CLASS = "com.googlecode.tesseract.android.TessBaseAPI"
+FILE_CLASS = "java.io.File"
+
+# Java classes already looked up through pyjnius, keyed by dotted name.
+_java_classes = {}
+_java_classes_lock = threading.Lock()
+
+
+def java_class(name):
+    """Return the pyjnius wrapper class for Java class `name` (cached).
+
+    The lookup itself uses JNI FindClass, which - see prepare_android_classes
+    - only works for the app's own classes on a thread that has a Java frame
+    below it (the Kivy main thread). Caching the resulting class object lets
+    the OCR worker thread reuse it safely: pyjnius keeps Java class and object
+    references as JNI global references, so they stay valid across threads.
+    """
+    with _java_classes_lock:
+        cls = _java_classes.get(name)
+        if cls is not None:
+            return cls
+        from jnius import autoclass
+        cls = autoclass(name)
+        _java_classes[name] = cls
+        return cls
+
+
+def prepare_android_classes():
+    """Load the Java classes used by OCR. MUST run on the Kivy main thread.
+
+    Why this is not done inside the OCR worker: Android's JNI FindClass uses
+    the class loader of the nearest Java frame on the stack. The Kivy main
+    thread is started from the Java activity, so it sees the app's own
+    classes - including ones from `android.gradle_dependencies` such as
+    Tesseract4Android. A plain Python worker thread (the scan runs in one)
+    is attached with AttachCurrentThread and has no Java frame, so FindClass
+    falls back to the system class loader and fails with
+    `DexPathList[[directory "."], ...]` / ClassNotFoundException even though
+    the class is inside the APK. Resolving the class here once avoids that.
+    """
+    try:
+        tess = java_class(TESS_CLASS)
+    except Exception as exc:  # noqa: BLE001
+        raise OcrUnavailable(
+            "%s could not be loaded from the APK. The Tesseract4Android "
+            "library is missing (check android.gradle_dependencies and the "
+            "build log). Java said: %s" % (TESS_CLASS, exc))
+    try:
+        java_class(FILE_CLASS)   # boot class; resolved here for consistency
+    except Exception:  # noqa: BLE001
+        pass
+    print("OCR engine ready: %s loaded" % TESS_CLASS)   # visible in logcat
+    return tess
+
+
 class AndroidTesseract:
     """Real Tesseract (Tesseract4Android AAR) driven through pyjnius."""
 
-    def __init__(self, data_root, cache_dir):
+    def __init__(self, data_root, cache_dir, tess_class=None):
         self.data_root = data_root          # contains tessdata/eng.traineddata
         self.cache_dir = cache_dir
+        self.tess_class = tess_class        # resolved on the main thread
         self.api = None
         self.lock = threading.Lock()
 
@@ -439,19 +495,17 @@ class AndroidTesseract:
         if not os.path.exists(data) or os.path.getsize(data) < 1000000:
             raise OcrUnavailable("eng.traineddata is missing from the app.")
         try:
-            from jnius import autoclass
-            Tess = autoclass("com.googlecode.tesseract.android.TessBaseAPI")
+            Tess = self.tess_class or java_class(TESS_CLASS)
         except Exception as exc:  # noqa: BLE001
             raise OcrUnavailable(
-                "The Tesseract library is not inside this APK (%s)." % exc)
+                "Tesseract (%s) could not be loaded: %s" % (TESS_CLASS, exc))
         api = Tess()
         if not api.init(self.data_root, "eng"):
             raise OcrUnavailable("Tesseract could not load eng.traineddata.")
         self.api = api
 
     def recognize(self, pil_img, psm):
-        from jnius import autoclass
-        File = autoclass("java.io.File")
+        File = java_class(FILE_CLASS)
         with self.lock:
             self._init()
             path = os.path.join(self.cache_dir, "ocr_%s.png" % uuid.uuid4().hex)
@@ -680,6 +734,22 @@ def build_app():  # noqa: C901 - one flat function keeps the project to one file
         view.open()
         Clock.schedule_once(lambda dt: view.dismiss(), seconds)
 
+    def show_error(title, message):
+        """Dismissible, scrollable popup for long messages (Java exceptions)."""
+        box = BoxLayout(orientation="vertical", padding=dp(10), spacing=dp(8))
+        scroll = ScrollView(size_hint=(1, 1))
+        label = Label(text=message, color=WHITE, font_size=sp(13),
+                      halign="left", valign="top", size_hint_y=None)
+        label.bind(width=lambda w, v: setattr(w, "text_size", (v, None)))
+        label.bind(texture_size=lambda w, ts: setattr(w, "height", ts[1] + dp(8)))
+        scroll.add_widget(label)
+        box.add_widget(scroll)
+        pop = Popup(title=title, content=box, size_hint=(0.92, 0.65),
+                    auto_dismiss=True)
+        box.add_widget(Btn("Close", "secondary", size_hint_y=None,
+                           height=dp(44), on_press=lambda *_: pop.dismiss()))
+        pop.open()
+
     def confirm(title, message, on_yes, yes_text="Yes"):
         box = BoxLayout(orientation="vertical", padding=dp(10), spacing=dp(10))
         box.add_widget(Label(text=message, color=WHITE, font_size=sp(15),
@@ -757,7 +827,12 @@ def build_app():  # noqa: C901 - one flat function keeps the project to one file
                 app_dir = os.path.dirname(os.path.abspath(__file__))
                 if ANDROID:
                     install_language_data(app_dir, self.data_dir)
-                    self.backend = AndroidTesseract(self.data_dir, self.cache_dir)
+                    # Resolve the Tesseract Java class HERE, on the main
+                    # thread, before the OCR worker thread is started.
+                    # See prepare_android_classes() for the full reason.
+                    self.backend = AndroidTesseract(
+                        self.data_dir, self.cache_dir,
+                        tess_class=prepare_android_classes())
                 else:
                     self.backend = DesktopTesseract(
                         app_dir if os.path.exists(os.path.join(
@@ -1011,7 +1086,9 @@ def build_app():  # noqa: C901 - one flat function keeps the project to one file
         def ocr_done(self, res, error):
             self.busy.dismiss()
             if error is not None:
-                return notify("OCR failed: %s" % error, 5)
+                text = str(error)
+                print("OCR error: %s" % text)   # full text in `adb logcat`
+                return show_error("OCR failed", text[:1500])
             self.result = res
             self.open_result()
 

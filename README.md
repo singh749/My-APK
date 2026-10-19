@@ -115,6 +115,19 @@ reports an error, use **Upload Image** with a photo taken in your camera app.
 `android.gradle_dependencies` and that the build log shows tesseract4android being
 resolved), or `could not load eng.traineddata` (corrupt file: re-download).
 
+**`OCR failed: ... Didn't find class "com.googlecode.tesseract.android.TessBaseAPI"
+... on path: DexPathList[[directory "."]]`** - this is a pyjnius/JNI class-loader
+trap, not a broken APK. `FindClass` only sees the app's own classes (including
+Gradle AARs such as Tesseract4Android) while a Java frame is on the thread's
+stack: true for the Kivy main thread, false for a plain Python `threading.Thread`,
+which Android attaches as a native thread and which therefore sees only the
+system class path (`[directory "."]`). OCR runs in a background thread, so the
+app now resolves `TessBaseAPI` **once on the main thread** at startup
+(`prepare_android_classes()` in `main.py`) and passes the cached class object to
+the worker. Scanning with an APK built before this change - or with a class
+genuinely missing from the dex - still shows the raw error. Rebuild the APK; the
+full text of any OCR error is also printed to `adb logcat`.
+
 **Read crash logs** - `adb logcat | grep -i -E "python|tess|AndroidRuntime"`.
 
 ## Honest status
