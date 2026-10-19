@@ -260,27 +260,50 @@ def adaptive_threshold(gray, block=31, c=8):
     return diff.point(lambda v: 255 if v < c else 0).convert("L")
 
 
-def preprocess_variants(img, target=1600):
-    """Return {name: grayscale PIL image} - several views for OCR."""
+def relief_variants(gray):
+    """Edge-based views for engraved / embossed / punched characters on shiny
+    metal, where brightness alone does not separate the digits from the
+    background. Pure Pillow (difference of two blurs)."""
+    edges = ImageOps.autocontrast(ImageChops.difference(
+        gray.filter(ImageFilter.GaussianBlur(1)),
+        gray.filter(ImageFilter.GaussianBlur(4))), cutoff=1)
+    t = otsu_threshold(edges)
+    bold = edges.point(lambda v, t=t: 255 if v > t else 0).filter(
+        ImageFilter.MaxFilter(3)).filter(ImageFilter.MedianFilter(3))
+    soft = edges.filter(ImageFilter.GaussianBlur(1.5)).point(
+        lambda v: min(255, v * 2))
+    return ImageOps.invert(bold), ImageOps.invert(soft)
+
+
+def preprocess_variants(img, target=1600, line_height=110):
+    """Return {name: grayscale PIL image} - several views for OCR.
+
+    A wide, short image (a tightly cropped line of characters) is scaled so
+    the characters are about `line_height` px tall; anything else is scaled so
+    its longest side is about `target` px."""
     gray = ImageOps.grayscale(img)
-    longest = max(gray.size)
-    k = min(max(target / float(longest), 0.5), 3.0)
+    if gray.width / float(gray.height) >= 2.5:
+        k = min(max(line_height / float(gray.height), 0.3), 4.0)
+    else:
+        k = min(max(target / float(max(gray.size)), 0.5), 3.0)
     if abs(k - 1.0) > 0.05:
         gray = gray.resize((max(1, int(gray.width * k)),
                             max(1, int(gray.height * k))), Image.LANCZOS)
     plain = ImageOps.autocontrast(gray, cutoff=1)
     enhanced = ImageOps.autocontrast(plain.filter(
         ImageFilter.UnsharpMask(radius=2, percent=150, threshold=3)), cutoff=1)
-    t = otsu_threshold(ImageOps.autocontrast(gray.filter(
-        ImageFilter.GaussianBlur(1)), cutoff=1))
     blurred = ImageOps.autocontrast(gray.filter(ImageFilter.GaussianBlur(1)),
                                     cutoff=1)
+    t = otsu_threshold(blurred)
+    relief, relief_soft = relief_variants(gray)
     return {
         "gray": plain,
         "enhanced": enhanced,
         "otsu": blurred.point(lambda v, t=t: 255 if v > t else 0).convert("L"),
         "adaptive": adaptive_threshold(plain),
         "inverted": ImageOps.invert(enhanced),
+        "relief": relief,
+        "relief_soft": relief_soft,
     }
 
 
@@ -325,7 +348,9 @@ def _score(cand, conf):
 # Which preprocessing variant is run with which Tesseract page-segmentation
 # mode (6 = block of text, 7 = single line, 11 = sparse text).
 PASS_PLAN = [("enhanced", 6), ("enhanced", 7), ("otsu", 6),
-             ("adaptive", 6), ("inverted", 6), ("gray", 11)]
+             ("adaptive", 6), ("inverted", 6), ("gray", 11),
+             ("relief", 7), ("relief", 8), ("relief_soft", 7),
+             ("relief_soft", 8)]
 
 
 def run_ocr(img, backend, plan=PASS_PLAN, progress=None):
@@ -342,7 +367,8 @@ def run_ocr(img, backend, plan=PASS_PLAN, progress=None):
         if progress:
             progress(i, len(plan))
         try:
-            text, conf = backend.recognize(variants[name], psm)
+            text, conf = backend.recognize(
+                ImageOps.expand(variants[name], 20, 255), psm)
         except Exception as exc:  # noqa: BLE001
             last_error = exc
             continue
