@@ -1,0 +1,7 @@
+# Desktop / CI test dependencies.
+# The Android build dependencies are listed in buildozer.spec ("requirements =").
+pillow
+numpy
+pytest
+# Optional, only to run the UI on a desktop for quick checks:
+# kivy
