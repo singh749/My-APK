@@ -33,8 +33,9 @@ android.enable_androidx = True
 android.gradle_dependencies = cz.adaptech.tesseract4android:tesseract4android:4.9.0
 android.add_gradle_repositories = maven { url 'https://jitpack.io' }
 
-# Pin python-for-android to a known release for reproducible builds.
-p4a.branch = v2026.05.09
+# Pin python-for-android to an exact commit (v2026.05.09 fails on charset_normalizer Android wheels; fixed on develop).
+p4a.branch = develop
+p4a.commit = 8ef9d1dbbf769d2c14681dbc3c116c85e2e93bae
 
 [buildozer]
 log_level = 2
