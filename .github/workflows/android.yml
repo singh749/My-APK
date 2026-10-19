@@ -46,7 +46,7 @@ jobs:
         with:
           python-version: "3.11"
 
-      - uses: actions/setup-java@v4
+      - uses: actions/setup-java@v5
         with:
           distribution: temurin
           java-version: "17"
@@ -92,7 +92,31 @@ jobs:
         run: pip install --upgrade pip buildozer==1.6.0 cython virtualenv
 
       - name: Build debug APK
-        run: buildozer -v android debug
+        run: |
+          set -o pipefail
+          buildozer -v android debug 2>&1 | tee build.log
+
+      - name: Show build error summary
+        if: failure()
+        run: |
+          {
+            echo '### Build errors (copy this section)'
+            echo '```'
+            grep -n -iE 'error|exception|failed|not found|no such|cannot' build.log | tail -40 || true
+            echo '--- last 40 lines ---'
+            tail -40 build.log
+            echo '```'
+          } >> "$GITHUB_STEP_SUMMARY"
+          MSG=$(grep -iE 'error|exception|failed' build.log | tail -6 | sed 's/%/%25/g' | awk '{printf "%s%%0A", $0}')
+          echo "::error title=Build failed - key lines::${MSG}"
+
+      - name: Upload build log
+        if: always()
+        uses: actions/upload-artifact@v4
+        with:
+          name: build-log
+          path: build.log
+          if-no-files-found: ignore
 
       - name: Verify APK contents
         run: |
