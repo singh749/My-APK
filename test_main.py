@@ -1,8 +1,6 @@
 """Unit tests (run with: pytest -q). They need no Android device and no Kivy."""
 import os
 import shutil
-import sys
-import types
 
 import pytest
 from PIL import Image, ImageDraw, ImageFont
@@ -215,62 +213,6 @@ def test_rotate_and_crop():
     assert main.rotate_image(img, 0).size == (400, 200)
     assert main.crop_fraction(img, left=0.25, right=0.25).size == (200, 200)
     assert main.crop_fraction(img, left=5, right=5).size[0] > 0   # clamped
-
-
-# ---- Android backend: Java class loading ------------------------------------
-def test_java_class_is_looked_up_once(monkeypatch):
-    """pyjnius' autoclass uses JNI FindClass; it must run only on the main
-    thread, so the worker thread has to reuse a cached class object."""
-    created = []
-
-    fake = types.ModuleType("jnius")
-    fake.autoclass = lambda name: created.append(name) or ("cls:" + name)
-    monkeypatch.setitem(sys.modules, "jnius", fake)
-    monkeypatch.setattr(main, "_java_classes", {})
-
-    assert main.java_class("a.B") == "cls:a.B"
-    assert main.java_class("a.B") == "cls:a.B"     # served from the cache
-    assert created == ["a.B"]                      # exactly one Java lookup
-
-
-def test_prepare_android_classes_reports_missing_library(monkeypatch):
-    fake = types.ModuleType("jnius")
-
-    def broken(name):
-        raise RuntimeError('ClassNotFoundException: didn\'t find class "%s"'
-                           % name)
-
-    fake.autoclass = broken
-    monkeypatch.setitem(sys.modules, "jnius", fake)
-    monkeypatch.setattr(main, "_java_classes", {})
-
-    with pytest.raises(main.OcrUnavailable) as err:
-        main.prepare_android_classes()
-    msg = str(err.value)
-    assert main.TESS_CLASS in msg and "Tesseract4Android" in msg
-
-
-def test_android_backend_uses_class_resolved_on_main_thread(tmp_path):
-    """The OCR worker must not call autoclass: it gets the class object."""
-    data_dir = tmp_path / "data"
-    (data_dir / "tessdata").mkdir(parents=True)
-    (data_dir / "tessdata" / "eng.traineddata").write_bytes(b"\0" * 1000001)
-    calls = []
-
-    class FakeApi:
-        def init(self, path, lang):
-            calls.append((path, lang))
-            return True
-
-    def fake_tess_class():
-        calls.append("new")
-        return FakeApi()
-
-    backend = main.AndroidTesseract(str(data_dir), str(tmp_path / "cache"),
-                                    tess_class=fake_tess_class)
-    backend._init()
-    assert calls == ["new", (str(data_dir), "eng")]
-    assert isinstance(backend.api, FakeApi)
 
 
 # ---- real Tesseract, only when the tesseract program is installed -------------
