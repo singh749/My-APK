@@ -144,6 +144,15 @@ jobs:
           [ "${FOUND:-0}" = "1" ] || { echo "::error::TessBaseAPI class missing from APK"; exit 1; }
           echo "OK: Tesseract Java wrapper and native libraries are bundled"
 
+          # 4. ML Kit (second OCR engine, bundled model) must be inside the APK
+          unzip -Z1 "$APK" | grep -iE '^lib/.+/lib[^/]*mlkit[^/]*\.so$' \
+            || { echo "::error::ML Kit native libraries missing from APK"; exit 1; }
+          for d in $(unzip -Z1 "$APK" | grep -E '^classes[0-9]*\.dex$'); do
+            unzip -p "$APK" "$d" | grep -aq 'com/google/mlkit/vision/text/TextRecognition' && MLFOUND=1
+          done
+          [ "${MLFOUND:-0}" = "1" ] || { echo "::error::ML Kit classes missing from APK"; exit 1; }
+          echo "OK: ML Kit is bundled"
+
       - name: Upload APK
         uses: actions/upload-artifact@v4
         with:
