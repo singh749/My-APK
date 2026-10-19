@@ -1,0 +1,129 @@
+name: Build Android APK
+
+on:
+  push:
+    branches: [main]
+  pull_request:
+  workflow_dispatch:
+
+env:
+  # Official English model (tessdata_fast). Used only if eng.traineddata is not
+  # already committed to the repository. The download is verified by SHA-256.
+  TESSDATA_URL: https://raw.githubusercontent.com/tesseract-ocr/tessdata_fast/main/eng.traineddata
+  TESSDATA_SHA256: 7d4322bd2a7749724879683fc3912cb542f19906c83bcc1a52132556427170b2
+
+jobs:
+  test:
+    name: Python tests
+    runs-on: ubuntu-24.04
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-python@v5
+        with:
+          python-version: "3.11"
+      - name: Install test dependencies (incl. desktop Tesseract for the OCR test)
+        run: |
+          sudo apt-get update
+          sudo apt-get install -y tesseract-ocr
+          pip install -r requirements.txt pytesseract
+      - name: Ensure eng.traineddata (used by the real-OCR test)
+        run: |
+          if [ ! -f eng.traineddata ]; then
+            curl -fL --retry 3 -o eng.traineddata "$TESSDATA_URL"
+          fi
+      - name: Run tests
+        run: python -m pytest -v
+
+  build:
+    name: Build debug APK
+    needs: test
+    runs-on: ubuntu-24.04
+    timeout-minutes: 150
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: actions/setup-python@v5
+        with:
+          python-version: "3.11"
+
+      - uses: actions/setup-java@v4
+        with:
+          distribution: temurin
+          java-version: "17"
+
+      - name: Install Android build dependencies
+        run: |
+          sudo apt-get update
+          sudo apt-get install -y git zip unzip autoconf automake libtool \
+            libltdl-dev pkg-config zlib1g-dev libncurses-dev cmake \
+            libffi-dev libssl-dev build-essential ccache
+
+      - name: Get and verify English OCR language data
+        run: |
+          set -euo pipefail
+          DOWNLOADED=0
+          if [ ! -f eng.traineddata ]; then
+            echo "eng.traineddata not in repo - downloading official file"
+            curl -fL --retry 3 -o eng.traineddata "$TESSDATA_URL"
+            DOWNLOADED=1
+          fi
+          SIZE=$(stat -c%s eng.traineddata)
+          ACTUAL=$(sha256sum eng.traineddata | cut -d' ' -f1)
+          echo "eng.traineddata: $SIZE bytes, sha256 $ACTUAL"
+          if [ "$SIZE" -lt 1000000 ]; then
+            echo "::error::eng.traineddata is missing or too small (not a real model)"; exit 1
+          fi
+          if [ "$ACTUAL" != "$TESSDATA_SHA256" ]; then
+            if [ "$DOWNLOADED" = "1" ]; then
+              echo "::error::Downloaded eng.traineddata failed SHA-256 verification"; exit 1
+            fi
+            echo "::warning::Committed eng.traineddata differs from the official tessdata_fast file (OK if you intentionally use another genuine model, e.g. tessdata_best)."
+          fi
+
+      - name: Cache Buildozer, SDK and NDK
+        uses: actions/cache@v4
+        with:
+          path: |
+            ~/.buildozer
+            .buildozer
+          key: buildozer-${{ runner.os }}-${{ hashFiles('buildozer.spec') }}
+
+      - name: Install Buildozer
+        run: pip install --upgrade pip buildozer==1.6.0 cython virtualenv
+
+      - name: Build debug APK
+        run: buildozer -v android debug
+
+      - name: Verify APK contents
+        run: |
+          set -euo pipefail
+          APK=$(ls bin/*.apk | head -n1)
+          test -s "$APK" || { echo "::error::APK missing"; exit 1; }
+          echo "Built: $APK ($(stat -c%s "$APK") bytes)"
+
+          # 1. language data must be inside the APK's bundled app files
+          ASSET=$(unzip -Z1 "$APK" | grep -E '^assets/private\.(tar|mp3)$' | head -n1 || true)
+          [ -n "$ASSET" ] || { echo "::error::app bundle not found in APK"; exit 1; }
+          unzip -p "$APK" "$ASSET" | tar -xzO --wildcards '*eng.traineddata' > /tmp/packed.traineddata
+          [ "$(sha256sum < /tmp/packed.traineddata)" = "$(sha256sum < eng.traineddata)" ] \
+            || { echo "::error::eng.traineddata missing or different inside APK"; exit 1; }
+          echo "OK: eng.traineddata is bundled in the APK"
+
+          # 2. native Tesseract / Leptonica libraries must be inside the APK
+          unzip -Z1 "$APK" | grep -iE '^lib/.+/lib[^/]*(tess|lept)[^/]*\.so$' \
+            || { echo "::error::Tesseract native libraries missing from APK"; exit 1; }
+
+          # 3. Java wrapper class must be inside the dex files
+          for d in $(unzip -Z1 "$APK" | grep -E '^classes[0-9]*\.dex$'); do
+            unzip -p "$APK" "$d" | grep -aq 'com/googlecode/tesseract/android/TessBaseAPI' && FOUND=1
+          done
+          [ "${FOUND:-0}" = "1" ] || { echo "::error::TessBaseAPI class missing from APK"; exit 1; }
+          echo "OK: Tesseract Java wrapper and native libraries are bundled"
+
+      - name: Upload APK
+        uses: actions/upload-artifact@v4
+        with:
+          name: engine-number-scanner-debug-apk
+          path: bin/*.apk
+          if-no-files-found: error
+          retention-days: 30
