@@ -28,9 +28,10 @@ android.accept_sdk_license = True
 android.archs = arm64-v8a
 android.enable_androidx = True
 
-# Real Tesseract OCR engine (native libs + Java wrapper), fetched at BUILD time
-# by Gradle and bundled in the APK. The installed app never downloads anything.
-android.gradle_dependencies = cz.adaptech.tesseract4android:tesseract4android:4.9.0
+# Two offline OCR engines, fetched at BUILD time by Gradle and bundled in the APK:
+#  - Tesseract (Tesseract4Android)  - Google ML Kit text recognition (bundled model)
+# The installed app never downloads anything.
+android.gradle_dependencies = cz.adaptech.tesseract4android:tesseract4android:4.9.0, com.google.mlkit:text-recognition:16.0.1
 android.add_gradle_repositories = maven { url 'https://jitpack.io' }
 
 # Pin python-for-android to an exact commit (v2026.05.09 fails on charset_normalizer Android wheels; fixed on develop).
